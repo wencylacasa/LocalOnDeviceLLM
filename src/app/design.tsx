@@ -1,4 +1,5 @@
 import { models, useLLMChatSession } from 'react-native-executorch';
+import { useIsFocused } from 'expo-router';
 import { useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
@@ -19,6 +20,18 @@ import { DashboardRenderer } from '@/components/dashboard/DashboardRenderer';
 import { parseSpec, isValidSpec } from '@/components/dashboard/parseSpec';
 import type { DashboardSpec } from '@/components/dashboard/types';
 
+const MAX_NEW_TOKENS = 768;
+
+/**
+ * true:  load a fresh model session after every dashboard. Each prompt starts
+ *        clean (a 0.6B model tends to copy the previous dashboard otherwise),
+ *        at the cost of a model reload between runs.
+ * false: keep the session warm and only swap it when the context window is
+ *        nearly full. Faster back-to-back runs, but earlier dashboards stay in
+ *        the model's history.
+ */
+const FRESH_SESSION_EVERY_RUN = true;
+
 const SYSTEM_PROMPT = `You are an AI Dashboard Designer. /no_think
 Your job is to generate a JSON specification for a dashboard layout based on the user's prompt.
 You MUST output ONLY valid JSON. Do not include conversational text outside the JSON.
@@ -26,10 +39,8 @@ You MUST output ONLY valid JSON. Do not include conversational text outside the 
 SCHEMA:
 {
   "title": "string",
-  "theme": "dark" | "light" | "auto",
-  "widgets": [
-    // widget objects
-  ]
+  "theme": "auto",
+  "widgets": [ <widget>, <widget> ]
 }
 
 WIDGET TYPES:
@@ -41,7 +52,8 @@ WIDGET TYPES:
 6. button: { "type": "button", "label": "Tap Me", "color": "#3c87f7" }
 7. grid: { "type": "grid", "items": [ { stat1 }, { stat2 }, { stat3 }, { stat4 } ] } (max 4 stat items)
 
-Generate creative, realistic data. Use visually pleasing hex colors for "color" fields.
+Rules: use 4 to 6 widgets in total. Keep labels short. Numbers in "data" and the progress "value" must be unquoted numbers. Colors must be 6-digit hex like #3c87f7.
+Generate creative, realistic data.
 Output ONLY JSON.`;
 
 const EXAMPLES = [
@@ -51,21 +63,77 @@ const EXAMPLES = [
   'A simple task manager',
 ];
 
+type Result = {
+  spec: DashboardSpec | null;
+  error: string | null;
+  raw: string;
+};
+
+const EMPTY_RESULT: Result = { spec: null, error: null, raw: '' };
+
+const errorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+function buildResult(raw: string): Result {
+  try {
+    const spec = parseSpec(raw);
+    if (isValidSpec(spec)) return { spec, error: null, raw };
+    return {
+      spec: null,
+      raw,
+      error: 'The generated dashboard is missing required fields (title, widgets).',
+    };
+  } catch (err) {
+    return { spec: null, raw, error: `Could not parse JSON: ${errorMessage(err)}` };
+  }
+}
+
+/**
+ * The input and the last result live here, above the model session, so they
+ * survive the session being swapped out for a fresh one (see DesignSession).
+ */
 export default function DesignScreen() {
-  const theme = useTheme();
-  const scrollRef = useRef<ScrollView>(null);
-  
+  const [sessionId, setSessionId] = useState(0);
   const [input, setInput] = useState('');
+  const [result, setResult] = useState<Result>(EMPTY_RESULT);
+
+  return (
+    <DesignSession
+      key={sessionId}
+      input={input}
+      setInput={setInput}
+      result={result}
+      setResult={setResult}
+      onFreshSession={() => setSessionId((n) => n + 1)}
+    />
+  );
+}
+
+interface SessionProps {
+  input: string;
+  setInput: (value: string) => void;
+  result: Result;
+  setResult: (value: Result) => void;
+  onFreshSession: () => void;
+}
+
+function DesignSession({ input, setInput, result, setResult, onFreshSession }: SessionProps) {
+  const theme = useTheme();
+  const isFocused = useIsFocused();
+  const stoppedRef = useRef(false);
+
   const [isGenerating, setIsGenerating] = useState(false);
-  const [rawOutput, setRawOutput] = useState('');
-  const [dashboardSpec, setDashboardSpec] = useState<DashboardSpec | null>(null);
-  const [parseError, setParseError] = useState<string | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
+  const [tokenCount, setTokenCount] = useState(0);
+  const [livePreview, setLivePreview] = useState('');
 
   const session = useLLMChatSession(models.llm.QWEN3_0_6B.DEFAULT, {
+    // Only the visible tab keeps the model in memory (Chat and Design would
+    // otherwise hold one copy each). A run that is still going keeps it alive.
+    preventLoad: !isFocused && !isGenerating,
     initialMessages: [{ role: 'system', content: SYSTEM_PROMPT }],
     generationConfig: {
       temperature: 0.7,
-      maxNewTokens: 1024,
+      maxNewTokens: MAX_NEW_TOKENS,
     },
   });
 
@@ -79,55 +147,71 @@ export default function DesignScreen() {
       setInput(overridePrompt);
     }
 
-    setRawOutput('');
-    setDashboardSpec(null);
-    setParseError(null);
+    stoppedRef.current = false;
+    setIsStopping(false);
+    setResult(EMPTY_RESULT);
+    setTokenCount(0);
+    setLivePreview('');
     setIsGenerating(true);
-    // The session maintains history, we rely on the system prompt to guide it again.
 
     let generatedText = '';
+    let count = 0;
+    let next: Result;
     try {
       await session.sendMessage(text, (token) => {
         generatedText += token;
-        // Optional: could stream the raw text, but might be jarring if it's JSON.
-        // We will just show "Generating..." below.
+        count += 1;
+        // Throttled so a re-render per token doesn't slow generation down.
+        if (count % 8 === 0) {
+          setTokenCount(count);
+          setLivePreview(generatedText.slice(-160));
+        }
       });
 
-      // Parse after generation is complete
-      setRawOutput(generatedText);
-      try {
-        const parsed = parseSpec(generatedText);
-        if (isValidSpec(parsed)) {
-          setDashboardSpec(parsed);
-        } else {
-          setParseError('The generated dashboard is missing required fields (title, widgets).');
-        }
-      } catch (err: any) {
-        setParseError(`Could not parse JSON: ${err.message}`);
-      }
-    } catch (err: any) {
-      setParseError(`Generation failed: ${err.message}`);
-    } finally {
-      setIsGenerating(false);
+      // A stopped run is cancelled, not parsed: half a dashboard isn't a result.
+      next = stoppedRef.current ? EMPTY_RESULT : buildResult(generatedText);
+    } catch (err) {
+      next = { spec: null, raw: generatedText, error: `Generation failed: ${errorMessage(err)}` };
     }
+
+    setResult(next);
+    setIsGenerating(false);
+    setIsStopping(false);
+
+    // The session keeps every turn in its history and has no "clear", so a
+    // fresh one is swapped in (always, or once the context is nearly full; see
+    // FRESH_SESSION_EVERY_RUN). Input and result are held by the parent, so
+    // the screen keeps looking the same while it reloads.
+    const kv = session.getKVCacheState?.();
+    const nearlyFull = !kv || kv.remainingTokens < MAX_NEW_TOKENS + 256;
+    if (FRESH_SESSION_EVERY_RUN || nearlyFull) onFreshSession();
   }
 
   function handleStop() {
+    if (!isGenerating || isStopping) return;
+    // Only ask the model to stop. isGenerating flips back once sendMessage
+    // actually settles, so a new run can't overlap the one still winding down.
+    stoppedRef.current = true;
+    setIsStopping(true);
     session.stop?.();
-    setIsGenerating(false);
   }
 
   let status: string | null = null;
   if (session.error) {
     status = `Could not load the model: ${session.error.message}`;
   } else if (!session.isReady) {
-    status = `Downloading / loading Qwen3 0.6B… ${Math.round(session.downloadProgress)}%`;
+    status =
+      session.downloadProgress < 100
+        ? `Downloading Qwen3 0.6B… ${Math.round(session.downloadProgress)}%`
+        : 'Loading Qwen3 0.6B into memory…';
   }
+
+  const { spec, error, raw } = result;
 
   return (
     <ThemedView style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
-        
+
         <View style={styles.headerRow}>
           <View>
             <ThemedText type="subtitle" style={styles.title}>
@@ -145,15 +229,14 @@ export default function DesignScreen() {
           </ThemedView>
         )}
 
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.contentFlex}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.contentFlex}>
           <ScrollView
-            ref={scrollRef}
             style={styles.scroll}
             contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
           >
             {/* If empty state and no errors/loading */}
-            {!isGenerating && !dashboardSpec && !parseError && !rawOutput && (
+            {!isGenerating && !spec && !error && !raw && (
               <View style={styles.examplesContainer}>
                 <ThemedText type="smallBold" themeColor="textSecondary">
                   Try an example:
@@ -175,29 +258,38 @@ export default function DesignScreen() {
 
             {isGenerating && (
               <View style={styles.loadingContainer}>
-                <ThemedText type="subtitle">Generating dashboard...</ThemedText>
-                <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.one }}>
-                  The on-device model is designing your layout.
+                <ThemedText type="subtitle">
+                  {isStopping ? 'Stopping...' : 'Generating dashboard...'}
                 </ThemedText>
+                <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.one }}>
+                  {tokenCount === 0
+                    ? 'Reading the prompt (the first token can take a while on device)...'
+                    : `${tokenCount} tokens so far (max ${MAX_NEW_TOKENS})`}
+                </ThemedText>
+                {livePreview ? (
+                  <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.two }}>
+                    {livePreview}
+                  </ThemedText>
+                ) : null}
               </View>
             )}
 
-            {dashboardSpec && !isGenerating && (
+            {spec && !isGenerating && (
               <View style={styles.resultContainer}>
-                <DashboardRenderer spec={dashboardSpec} />
+                <DashboardRenderer spec={spec} />
               </View>
             )}
 
-            {parseError && !isGenerating && (
+            {error && !isGenerating && (
               <View style={styles.errorContainer}>
                 <ThemedText type="smallBold" style={{ color: '#d9534f' }}>
-                  Oops! {parseError}
+                  Oops! {error}
                 </ThemedText>
                 <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.two, marginBottom: Spacing.one }}>
                   Raw output from AI:
                 </ThemedText>
                 <View style={[styles.rawCode, { backgroundColor: theme.backgroundElement }]}>
-                  <ThemedText type="small">{rawOutput}</ThemedText>
+                  <ThemedText type="small">{raw}</ThemedText>
                 </View>
               </View>
             )}
@@ -217,11 +309,16 @@ export default function DesignScreen() {
                 placeholderTextColor={theme.textSecondary}
                 editable={session.isReady && !isGenerating}
                 multiline
-                onSubmitEditing={() => handleGenerate()}
               />
               {isGenerating ? (
-                <Pressable onPress={handleStop} style={[styles.button, styles.stopButton]}>
-                  <ThemedText type="smallBold" style={styles.userText}>Stop</ThemedText>
+                <Pressable
+                  onPress={handleStop}
+                  disabled={isStopping}
+                  style={[styles.button, styles.stopButton, isStopping && styles.buttonDisabled]}
+                >
+                  <ThemedText type="smallBold" style={styles.userText}>
+                    {isStopping ? 'Stopping' : 'Stop'}
+                  </ThemedText>
                 </Pressable>
               ) : (
                 <Pressable

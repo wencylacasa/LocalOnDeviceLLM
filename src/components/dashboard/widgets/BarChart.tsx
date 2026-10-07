@@ -15,7 +15,10 @@ export function BarChart({ widget }: Props) {
   const accent = widget.color ?? '#3c87f7';
 
   const data = widget.data.slice(0, MAX_BARS);
-  const max = Math.max(...data, 1);
+  // Scale to the real peak. (Flooring this at 1 flattened any chart whose
+  // values are all below 1, e.g. rates or prices, and mislabeled the y-axis.)
+  const peak = Math.max(...data);
+  const max = peak > 0 ? peak : 1;
   const labels = widget.xLabels ?? [];
 
   return (

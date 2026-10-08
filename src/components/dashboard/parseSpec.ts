@@ -1,4 +1,5 @@
 import type { DashboardSpec, StatWidget, Widget } from './types';
+import { DEFAULT_ICON, isKnownIcon } from './icons';
 
 type Obj = Record<string, unknown>;
 
@@ -11,23 +12,18 @@ const text = (v: unknown): string | undefined =>
 const hex = (v: unknown): string | undefined =>
   typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim() : undefined;
 
-/**
- * SF Symbol names the renderer will pass to the icon view. A 0.6B model often
- * invents names that don't exist, which render as an empty badge on iOS.
- */
-const SF_SYMBOLS = new Set([
-  'star.fill', 'heart.fill', 'flame.fill', 'bolt.fill', 'figure.walk', 'figure.run',
-  'chart.bar.fill', 'chart.line.uptrend.xyaxis', 'dollarsign.circle.fill',
-  'bitcoinsign.circle.fill', 'thermometer', 'drop.fill', 'cloud.fill', 'sun.max.fill',
-  'moon.fill', 'wind', 'clock.fill', 'checkmark.circle.fill', 'list.bullet', 'calendar',
-  'bell.fill', 'cart.fill', 'house.fill', 'person.fill', 'map.fill', 'bed.double.fill',
-  'fork.knife', 'music.note', 'trophy.fill', 'target',
-]);
+/** Parses numbers the model wrote as strings, e.g. "1,200", "$5" or "72%". */
+const num = (n: unknown): number =>
+  typeof n === 'string' ? parseFloat(n.replace(/[,$€£%\s]/g, '')) : Number(n);
 
+/**
+ * Only icons from the shared map are accepted. A 0.6B model often invents
+ * names that don't exist, which would render as an empty badge.
+ */
 const symbol = (v: unknown): string | undefined => {
   const name = text(v)?.trim();
   if (!name) return undefined;
-  return SF_SYMBOLS.has(name) ? name : 'star.fill';
+  return isKnownIcon(name) ? name : DEFAULT_ICON;
 };
 
 /**
@@ -94,7 +90,7 @@ function normalizeWidget(w: unknown): Widget | null {
     case 'chart': {
       if (!Array.isArray(w.data)) return null;
       const data = w.data
-        .map((n) => Number(n))
+        .map(num)
         .filter((n) => Number.isFinite(n))
         .map((n) => Math.max(0, n));
       if (data.length === 0) return null;
@@ -146,9 +142,17 @@ function normalizeWidget(w: unknown): Widget | null {
 /** Drops widgets the renderer can't safely draw and coerces loose values. */
 function sanitizeSpec(obj: unknown): DashboardSpec | null {
   if (!isObj(obj) || !Array.isArray(obj.widgets)) return null;
+  const seen = new Set<string>();
   const widgets = obj.widgets
     .map((w) => normalizeWidget(w))
-    .filter((w): w is Widget => w !== null);
+    .filter((w): w is Widget => w !== null)
+    // Small models sometimes emit the same widget twice; keep the first.
+    .filter((w) => {
+      const key = JSON.stringify(w);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   if (widgets.length === 0) return null;
   const theme = obj.theme === 'dark' || obj.theme === 'light' ? obj.theme : 'auto';
   return { title: text(obj.title) ?? 'Dashboard', theme, widgets };

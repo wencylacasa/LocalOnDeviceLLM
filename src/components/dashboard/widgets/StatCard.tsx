@@ -3,6 +3,7 @@ import { SymbolView } from 'expo-symbols';
 import { ThemedText } from '@/components/themed-text';
 import { useTheme } from '@/hooks/use-theme';
 import { Spacing } from '@/constants/theme';
+import { DEFAULT_ICON, ICONS } from '../icons';
 import type { StatWidget } from '../types';
 
 interface Props {
@@ -13,6 +14,7 @@ interface Props {
 export function StatCard({ widget, compact = false }: Props) {
   const theme = useTheme();
   const accent = widget.color ?? '#3c87f7';
+  const icon = widget.icon ? (ICONS[widget.icon] ?? ICONS[DEFAULT_ICON]) : undefined;
 
   return (
     <View
@@ -23,10 +25,10 @@ export function StatCard({ widget, compact = false }: Props) {
       ]}
     >
       <View style={styles.topRow}>
-        {widget.icon && (
+        {icon && (
           <View style={[styles.iconBadge, { backgroundColor: accent + '22' }]}>
             <SymbolView
-              name={{ ios: widget.icon, android: 'star', web: 'star' } as any}
+              name={{ ios: icon.ios, android: icon.android, web: icon.android }}
               tintColor={accent}
               size={compact ? 16 : 20}
             />

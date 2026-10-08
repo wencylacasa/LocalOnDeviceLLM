@@ -10,6 +10,14 @@ interface Props {
 
 const MAX_BARS = 10;
 
+/** Short axis label: 12500 -> "12.5k", 0.857142 -> "0.86". */
+function formatAxis(n: number) {
+  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${+(n / 1_000).toFixed(1)}k`;
+  if (Number.isInteger(n)) return String(n);
+  return n < 1 ? n.toPrecision(2) : n.toFixed(1);
+}
+
 export function BarChart({ widget }: Props) {
   const theme = useTheme();
   const accent = widget.color ?? '#3c87f7';
@@ -52,8 +60,12 @@ export function BarChart({ widget }: Props) {
 
       {/* y-axis hint */}
       <View style={styles.yAxis}>
-        <ThemedText type="small" themeColor="textSecondary">{max.toLocaleString()}</ThemedText>
-        <ThemedText type="small" themeColor="textSecondary">0</ThemedText>
+        <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+          {formatAxis(max)}
+        </ThemedText>
+        <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+          0
+        </ThemedText>
       </View>
     </View>
   );
@@ -73,7 +85,7 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     height: 100,
     gap: 4,
-    paddingLeft: 28,
+    paddingLeft: 36,
   },
   barCol: {
     flex: 1,
@@ -103,6 +115,6 @@ const styles = StyleSheet.create({
     bottom: Spacing.three,
     justifyContent: 'space-between',
     alignItems: 'flex-end',
-    width: 24,
+    width: 32,
   },
 });

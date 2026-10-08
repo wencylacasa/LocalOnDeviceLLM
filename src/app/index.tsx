@@ -1,4 +1,4 @@
-import { models, useLLMChatSession, type llm } from 'react-native-executorch';
+import { useLLMChatSession, type llm } from 'react-native-executorch';
 import { useIsFocused } from 'expo-router';
 import { useRef, useState } from 'react';
 import {
@@ -16,6 +16,8 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { LLM_MODEL, LLM_NAME } from '@/constants/llm';
+import { findLoopUnit, trimLoop } from '@/lib/repetition';
 
 type ChatItem = {
   id: string;
@@ -32,11 +34,15 @@ const CONTEXT_RESERVE = 48;
 const MIN_REPLY_TOKENS = 96;
 // Update the bubble every N tokens instead of on every single one.
 const TOKENS_PER_UI_UPDATE = 3;
+// Check for a repetition loop every N tokens.
+const TOKENS_PER_LOOP_CHECK = 6;
 
 // "/no_think" is Qwen3's soft switch to skip the long reasoning preamble.
 const SYSTEM_MESSAGE: llm.ChatMessage = {
   role: 'system',
-  content: 'You are a helpful on-device assistant. Keep answers concise. /no_think',
+  content:
+    'You are a helpful on-device assistant. Keep answers concise. ' +
+    'Answer once and then stop; never repeat yourself or restate what you already said. /no_think',
 };
 
 // Qwen3 can "think" out loud inside <think>...</think>. Hide that from the bubble.
@@ -83,9 +89,10 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
   const [input, setInput] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [contextFull, setContextFull] = useState(false);
+  const [looped, setLooped] = useState(false);
 
-  // Downloads Qwen3 0.6B on first launch (cached afterwards), then loads it into memory.
-  const session = useLLMChatSession(models.llm.QWEN3_0_6B.DEFAULT, {
+  // Downloads the model on first launch (cached afterwards), then loads it into memory.
+  const session = useLLMChatSession(LLM_MODEL, {
     // Only the visible tab keeps the model in memory (Chat and Design would
     // otherwise hold one copy each). A reply that is still streaming keeps
     // it alive until it finishes.
@@ -94,7 +101,9 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
     // model that still remembers it. Read when the model (re)loads.
     initialMessages: [SYSTEM_MESSAGE, ...toHistory(messages)],
     generationConfig: {
-      temperature: 0.7,
+      // A touch warmer than before: with no repetition penalty available,
+      // very low temperatures make small models loop.
+      temperature: 0.8,
       maxNewTokens: MAX_NEW_TOKENS,
     },
   });
@@ -124,6 +133,7 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
     const assistantId = `${stamp}-a`;
 
     setInput('');
+    setLooped(false);
     setIsGenerating(true);
     setMessages((prev) => [
       ...prev,
@@ -134,7 +144,9 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
     // Tokens are buffered and flushed in small batches so the list doesn't
     // re-render (and re-scroll) once per token.
     let pending = '';
+    let generated = '';
     let count = 0;
+    let loopStopped = false;
     const flush = () => {
       if (!pending) return;
       const chunk = pending;
@@ -149,8 +161,16 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
         text,
         (token) => {
           pending += token;
+          generated += token;
           count += 1;
           if (count % TOKENS_PER_UI_UPDATE === 0) flush();
+
+          // Stuck repeating itself: stop now instead of burning the rest of
+          // the token budget. The repeats are trimmed once the run ends.
+          if (!loopStopped && count % TOKENS_PER_LOOP_CHECK === 0 && findLoopUnit(generated)) {
+            loopStopped = true;
+            session.stop?.();
+          }
         },
         // Don't let the reply run past the end of the context window.
         { maxNewTokens: Math.min(MAX_NEW_TOKENS, room) },
@@ -166,6 +186,13 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
       );
     } finally {
       flush();
+      if (loopStopped) {
+        setLooped(true);
+        const clean = trimLoop(generated);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === assistantId ? { ...m, content: clean } : m)),
+        );
+      }
       setIsGenerating(false);
       if (tokenRoom() < MIN_REPLY_TOKENS) setContextFull(true);
     }
@@ -195,14 +222,17 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
 
   let status: string | null = null;
   if (session.error) {
-    status = `Could not load the model: ${session.error.message}`;
+    status = `Could not load ${LLM_NAME}: ${session.error.message}`;
   } else if (!session.isReady) {
     status =
       session.downloadProgress < 100
-        ? `Downloading Qwen3 0.6B… ${Math.round(session.downloadProgress)}%`
-        : 'Loading Qwen3 0.6B into memory…';
+        ? `Downloading ${LLM_NAME} (first launch only, use Wi-Fi)… ${Math.round(session.downloadProgress)}%`
+        : `Loading ${LLM_NAME} into memory…`;
   } else if (contextFull) {
     status = "This conversation has used up the model's memory. Tap “New chat” to keep going.";
+  } else if (looped) {
+    // The repeated text is still in the model's history, so it can echo it.
+    status = 'The model started repeating itself, so I stopped it. If it keeps happening, tap “New chat”.';
   }
 
   return (
@@ -214,7 +244,7 @@ function ChatSession({ onNewChat }: { onNewChat: () => void }) {
               Local Chat
             </ThemedText>
             <ThemedText type="small" themeColor="textSecondary">
-              Qwen3 0.6B · runs fully on your device
+              {LLM_NAME} · runs fully on your device
             </ThemedText>
           </View>
           <Pressable

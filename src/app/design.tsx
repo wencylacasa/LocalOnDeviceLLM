@@ -1,4 +1,4 @@
-import { models, useLLMChatSession } from 'react-native-executorch';
+import { useLLMChatSession } from 'react-native-executorch';
 import { useIsFocused } from 'expo-router';
 import { useRef, useState } from 'react';
 import {
@@ -17,6 +17,9 @@ import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { DashboardRenderer } from '@/components/dashboard/DashboardRenderer';
+import { ICONS } from '@/components/dashboard/icons';
+import { LLM_MODEL, LLM_NAME } from '@/constants/llm';
+import { findLoopUnit, trimLoop } from '@/lib/repetition';
 import { parseSpec, isValidSpec } from '@/components/dashboard/parseSpec';
 import type { DashboardSpec } from '@/components/dashboard/types';
 
@@ -52,7 +55,8 @@ WIDGET TYPES:
 6. button: { "type": "button", "label": "Tap Me", "color": "#3c87f7" }
 7. grid: { "type": "grid", "items": [ { stat1 }, { stat2 }, { stat3 }, { stat4 } ] } (max 4 stat items)
 
-Rules: use 4 to 6 widgets in total. Keep labels short. Numbers in "data" and the progress "value" must be unquoted numbers. Colors must be 6-digit hex like #3c87f7.
+Rules: use 4 to 6 widgets in total. Never repeat a widget or reuse the same label twice. Keep labels short. Numbers in "data" and the progress "value" must be unquoted numbers. Colors must be 6-digit hex like #3c87f7.
+The "icon" value must be exactly one of: ${Object.keys(ICONS).join(', ')}.
 Generate creative, realistic data.
 Output ONLY JSON.`;
 
@@ -126,7 +130,7 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
   const [tokenCount, setTokenCount] = useState(0);
   const [livePreview, setLivePreview] = useState('');
 
-  const session = useLLMChatSession(models.llm.QWEN3_0_6B.DEFAULT, {
+  const session = useLLMChatSession(LLM_MODEL, {
     // Only the visible tab keeps the model in memory (Chat and Design would
     // otherwise hold one copy each). A run that is still going keeps it alive.
     preventLoad: !isFocused && !isGenerating,
@@ -156,6 +160,7 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
 
     let generatedText = '';
     let count = 0;
+    let loopStopped = false;
     let next: Result;
     try {
       await session.sendMessage(text, (token) => {
@@ -165,11 +170,21 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
         if (count % 8 === 0) {
           setTokenCount(count);
           setLivePreview(generatedText.slice(-160));
+
+          // Stuck repeating the same widget: stop instead of burning the rest
+          // of the token budget. The repeats are trimmed before parsing.
+          if (!loopStopped && findLoopUnit(generatedText)) {
+            loopStopped = true;
+            session.stop?.();
+          }
         }
       });
 
       // A stopped run is cancelled, not parsed: half a dashboard isn't a result.
-      next = stoppedRef.current ? EMPTY_RESULT : buildResult(generatedText);
+      // A loop stop is different: what finished before the loop is still good.
+      next = stoppedRef.current
+        ? EMPTY_RESULT
+        : buildResult(loopStopped ? trimLoop(generatedText) : generatedText);
     } catch (err) {
       next = { spec: null, raw: generatedText, error: `Generation failed: ${errorMessage(err)}` };
     }
@@ -198,12 +213,12 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
 
   let status: string | null = null;
   if (session.error) {
-    status = `Could not load the model: ${session.error.message}`;
+    status = `Could not load ${LLM_NAME}: ${session.error.message}`;
   } else if (!session.isReady) {
     status =
       session.downloadProgress < 100
-        ? `Downloading Qwen3 0.6B… ${Math.round(session.downloadProgress)}%`
-        : 'Loading Qwen3 0.6B into memory…';
+        ? `Downloading ${LLM_NAME} (first launch only, use Wi-Fi)… ${Math.round(session.downloadProgress)}%`
+        : `Loading ${LLM_NAME} into memory…`;
   }
 
   const { spec, error, raw } = result;
@@ -218,7 +233,7 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
               AI Dashboard Designer
             </ThemedText>
             <ThemedText type="small" themeColor="textSecondary">
-              Describe a dashboard, and Qwen3 will build it.
+              Describe a dashboard, and {LLM_NAME} will build it.
             </ThemedText>
           </View>
         </View>
@@ -285,12 +300,23 @@ function DesignSession({ input, setInput, result, setResult, onFreshSession }: S
                 <ThemedText type="smallBold" style={{ color: '#d9534f' }}>
                   Oops! {error}
                 </ThemedText>
-                <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.two, marginBottom: Spacing.one }}>
-                  Raw output from AI:
-                </ThemedText>
-                <View style={[styles.rawCode, { backgroundColor: theme.backgroundElement }]}>
-                  <ThemedText type="small">{raw}</ThemedText>
-                </View>
+                {!!raw && (
+                  <>
+                    <ThemedText type="small" themeColor="textSecondary" style={{ marginTop: Spacing.two, marginBottom: Spacing.one }}>
+                      Raw output from AI:
+                    </ThemedText>
+                    <View style={[styles.rawCode, { backgroundColor: theme.backgroundElement }]}>
+                      <ThemedText type="small">{raw}</ThemedText>
+                    </View>
+                  </>
+                )}
+                <Pressable
+                  onPress={() => handleGenerate()}
+                  disabled={!canGenerate}
+                  style={[styles.retryButton, { backgroundColor: theme.primary }, !canGenerate && styles.buttonDisabled]}
+                >
+                  <ThemedText type="smallBold" style={styles.userText}>Try again</ThemedText>
+                </Pressable>
               </View>
             )}
           </ScrollView>
@@ -405,6 +431,13 @@ const styles = StyleSheet.create({
   rawCode: {
     padding: Spacing.two,
     borderRadius: Spacing.two,
+  },
+  retryButton: {
+    marginTop: Spacing.three,
+    height: 44,
+    borderRadius: Spacing.three,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   inputContainer: {
     paddingBottom: BottomTabInset + Spacing.two,
